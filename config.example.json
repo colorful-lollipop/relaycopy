@@ -9,21 +9,10 @@
       "relay": {
         "host": "relaycopy@relay.example.org",
         "port": 2222,
-        "key_file": "~/.config/relaycopy/read_ed25519",
+        "key_file": "~/.config/relaycopy/relay_ed25519",
         "known_hosts": "~/.config/relaycopy/known_hosts"
       },
-      "upload": {
-        "host": "relaycopy@relay.example.org",
-        "port": 2222,
-        "key_file": "~/.config/relaycopy/upload_ed25519",
-        "known_hosts": "~/.config/relaycopy/known_hosts"
-      },
-      "cleanup": {
-        "host": "relaycopy@relay.example.org",
-        "port": 2222,
-        "key_file": "~/.config/relaycopy/cleanup_ed25519",
-        "known_hosts": "~/.config/relaycopy/known_hosts"
-      }
+      "key_mode": "unified"
     }
   }
 }

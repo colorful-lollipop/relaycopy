@@ -55,6 +55,7 @@ def parser():
     setup.add_argument("--sudo", action="store_true")
     setup.add_argument("--install-deps", action="store_true", help="allow signed distribution package installation on the relay")
     setup.add_argument("--apply", action="store_true", help="create the dedicated account, restricted keys and retention timer")
+    setup.add_argument("--upgrade", action="store_true", help="upgrade this controller's existing managed relay to one restricted key")
     worker = sub.add_parser("_worker")
     worker.add_argument("request")
     return p
@@ -91,6 +92,10 @@ def config(args):
     profile = data.get("profiles", {}).get(args.profile)
     if not isinstance(profile, dict) or not isinstance(profile.get("relay"), dict):
         raise RelayError("profile needs a relay SSH endpoint")
+    profile = dict(profile)
+    if profile.get("key_mode") == "unified":
+        profile["upload"] = profile["relay"]
+        profile["cleanup"] = profile["relay"]
     state = Path(data.get("state_dir", "~/.local/state/relaycopy")).expanduser()
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     if state.is_symlink() or state.stat().st_uid != os.getuid() or state.stat().st_mode & 0o022:
@@ -154,7 +159,8 @@ def run(args):
             raise RelayError("install the existing OpenSSH client and rsync first")
         rsync_version = subprocess.run(["rsync", "--version"], capture_output=True, text=True, check=True).stdout.splitlines()[0]
         emit("doctor", python=sys.version.split()[0], tools=available, rsync=rsync_version,
-             profile=args.profile, sources=sorted(data.get("sources", {})), state_dir=str(state))
+             profile=args.profile, key_mode=profile.get("key_mode", "legacy"),
+             sources=sorted(data.get("sources", {})), state_dir=str(state))
         return
     if args.command in ("receive", "status"):
         namespace, job = ticket_parts(args.ticket)

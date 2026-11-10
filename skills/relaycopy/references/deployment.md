@@ -18,8 +18,8 @@ and `/srv/relaycopy`. An unmanaged existing account or directory is rejected.
 Do not weaken host-key checking, reuse a host administrator key for transfers,
 or point the managed root at existing user data.
 
-Default output is `~/.config/relaycopy/config.json`, with separate upload/read/
-maintenance keys alongside it. Keep that directory outside every Git worktree,
+Default output is `~/.config/relaycopy/config.json`, with one `relay_ed25519`
+key alongside it. This key has upload/read/cleanup rights and is delegated to sources. Keep that directory outside every Git worktree,
 mode 0700, keys mode 0600. Never print, commit or upload its contents. The user
 should retain a private backup. Record only config location and deployment result.
 
@@ -36,3 +36,9 @@ quotas, additional network isolation and long-term archives are separate concern
 If setup fails, inspect its private setup.log and any recorded deployment receipt
 before retrying. It may already have created the dedicated account. Never remove
 an unmanaged account or replace another user's keys to force setup through.
+
+For an existing generated v0.2 controller, use `setup-relay --ssh ADMIN_ALIAS
+--upgrade --apply`. It verifies existing credentials and preserves the recorded
+root/account/namespace/TTL; old config and keys are backed up privately. The old
+upload key is reused, with the read/cleanup identities revoked. Update other
+controllers to the new config. Do not rerun fresh setup to replace a managed relay.

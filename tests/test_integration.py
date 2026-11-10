@@ -39,12 +39,13 @@ class SSHIntegration(unittest.TestCase):
         (cls.relay / "compute").mkdir(parents=True)
         (cls.managed / "releases").mkdir()
         (cls.managed / "transfer.lock").touch(mode=0o600)
-        atomic_json(cls.managed / "managed.json", {"version": 1, "namespace": "compute", "ttl_hours": 24})
+        atomic_json(cls.managed / "managed.json", {"version": 1, "namespace": "compute", "ttl_hours": 24,
+                    "key_mode": "unified", "rrsync": "/usr/bin/rrsync", "flock": "/usr/bin/flock"})
         cls.bundle = cls.base / "relaycp.pyz"
         cls.bundle.write_bytes(bundle())
         cls.tools = cls.base / "tools"
         cls.keys = {}
-        for name in ("host", "source", "upload", "read", "cleanup"):
+        for name in ("host", "source", "upload", "read", "cleanup", "unified"):
             key = cls.base / (name + "_key")
             subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)], check=True)
             cls.keys[name] = key
@@ -60,6 +61,8 @@ class SSHIntegration(unittest.TestCase):
             + cls.keys["read"].with_suffix(".pub").read_text()
             + f'restrict,command="{sys.executable} {cls.bundle} _relay --root {cls.managed} --namespace compute serve" '
             + cls.keys["cleanup"].with_suffix(".pub").read_text()
+            + f'restrict,command="{sys.executable} {cls.bundle} _relay --root {cls.managed} --namespace compute dispatch" '
+            + cls.keys["unified"].with_suffix(".pub").read_text()
         )
         cfg = cls.base / "sshd_config"
         cfg.write_text(f"Port {cls.port}\nListenAddress 127.0.0.1\nHostKey {cls.keys['host']}\n"
@@ -81,7 +84,7 @@ class SSHIntegration(unittest.TestCase):
                 time.sleep(0.1)
         cls.endpoints = {name: {"host": f"{cls.user}@127.0.0.1", "port": cls.port,
                                "key_file": str(cls.keys[name]), "known_hosts": str(cls.known)}
-                         for name in ("source", "upload", "read", "cleanup")}
+                         for name in ("source", "upload", "read", "cleanup", "unified")}
         cls.ssh_config = cls.base / "ssh_config"
         cls.ssh_config.write_text(f"Host compute\n HostName 127.0.0.1\n User {cls.user}\n Port {cls.port}\n"
                                   f" IdentityFile {cls.keys['source']}\n IdentitiesOnly yes\n UserKnownHostsFile {cls.known}\n")
@@ -161,7 +164,8 @@ class SSHIntegration(unittest.TestCase):
         self.assertEqual(digest(dest / source.name), digest(source))
         self.assertFalse((ROOT / "should-not-exist").exists())
         self.assertNotEqual(read_json(self.tools / "jobs/pipeline/process.json")["pid"], record["pid"])
-        self.assertEqual(len(list((self.tools / "keys").glob("upload_key-*"))), 1)
+        copied = [p for p in (self.tools / "keys").glob("upload_key-*") if digest(p) == digest(self.keys["upload"])]
+        self.assertEqual(len(copied), 1)
         for key in (self.tools / "keys").glob("upload_key-*"):
             self.assertEqual(key.stat().st_mode & 0o777, 0o600)
 
@@ -253,7 +257,7 @@ class SSHIntegration(unittest.TestCase):
                 transport.copy(self.base / "forbidden-read", "empty/payload")
 
     def test_keys_deny_forwarding_and_directory_escape(self):
-        for name in ("read", "upload", "cleanup"):
+        for name in ("read", "upload", "cleanup", "unified"):
             ssh, host = ssh_args(self.endpoints[name])
             denied = subprocess.run(ssh + ["-W", f"127.0.0.1:{self.port}", host], capture_output=True, timeout=15)
             self.assertNotEqual(denied.returncode, 0)
@@ -270,7 +274,9 @@ class SSHIntegration(unittest.TestCase):
         config.pop("sources")
         config["ssh_config"] = str(self.ssh_config)
         profile = config["profiles"]["default"]
-        profile["cleanup"] = self.endpoints["cleanup"]
+        profile.pop("upload")
+        profile["relay"] = self.endpoints["unified"]
+        profile["key_mode"] = "unified"
         profile["cleanup_after_receive"] = True
         profile["remote_dir"] = str(self.tools)
         alternate = self.base / "managed-config.json"
@@ -292,9 +298,33 @@ class SSHIntegration(unittest.TestCase):
         failed = self.cli("receive", "relay://compute/managed", str(other) + "/", config=alternate, check=False)
         self.assertNotEqual(failed.returncode, 0)
         self.assertIn("already released", failed.stdout)
-        ssh, host = ssh_args(self.endpoints["cleanup"])
+        ssh, host = ssh_args(self.endpoints["unified"])
         denied = subprocess.run(ssh + [host, "rm -rf /"], capture_output=True, timeout=15)
         self.assertNotEqual(denied.returncode, 0)
+
+    def test_unified_key_rejects_escape_shell_and_rsync_deletion(self):
+        ssh, host = ssh_args(self.endpoints["unified"])
+        outside = self.base / "unified-outside"
+        outside.write_bytes(b"keep")
+        for command in ("id", "sh -c id", "rsync --server; id", "rsync --daemon", "release ../outside " + "a" * 64):
+            denied = subprocess.run(ssh + [host, command], capture_output=True, timeout=15)
+            self.assertNotEqual(denied.returncode, 0, command)
+        for remote, upload in (("../outside", False), ("../outside", True), ("/tmp/outside", True)):
+            source, target = str(outside), host + ":" + remote
+            args = [source, target] if upload else [target, str(self.base / "escaped-unified")]
+            denied = subprocess.run(["rsync", "-e", shlex.join(ssh), *args], capture_output=True, timeout=15)
+            self.assertNotEqual(denied.returncode, 0, remote)
+        empty = self.base / "empty-unified"
+        empty.mkdir()
+        target = self.relay / "compute/no-delete"
+        target.mkdir()
+        (target / "keep").write_bytes(b"keep")
+        denied = subprocess.run(["rsync", "-r", "--delete", "-e", shlex.join(ssh), str(empty) + "/", host + ":no-delete/"],
+                                capture_output=True, timeout=15)
+        self.assertNotEqual(denied.returncode, 0)
+        self.assertEqual((target / "keep").read_bytes(), b"keep")
+        self.assertEqual(outside.read_bytes(), b"keep")
+        self.assertEqual(relay_action(self.endpoints["unified"], ["gc-dry-run"], self.base / "unified-gc.log")["status"], "complete")
 
     def test_maintenance_does_not_reuse_readonly_master(self):
         socket_path = self.base / "shared-cm"

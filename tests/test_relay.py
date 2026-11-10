@@ -1,8 +1,13 @@
 import json
+import base64
+import hashlib
+import os
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from relaycopy.common import RelayError, atomic_json
 from relaycopy.relay import RelayStore
@@ -69,6 +74,31 @@ class Maintenance(unittest.TestCase):
 
     def test_installer_program_compiles_before_any_remote_mutation(self):
         compile(INSTALL, "<installer>", "exec")
+
+    def test_installer_refuses_redeployment_and_foreign_controller_before_changes(self):
+        home = self.root / "home"
+        (home / ".ssh").mkdir(parents=True)
+        auth = home / ".ssh/authorized_keys"
+        auth.write_text('restrict ssh-ed25519 dGVzdA==\n')
+        policy = {"version": 1, "namespace": "files", "user": "testrelay", "uid": os.getuid(),
+                  "authorized_keys_sha256": hashlib.sha256(auth.read_bytes()).hexdigest()}
+        atomic_json(self.root / "managed.json", policy)
+        payload = {"user": "testrelay", "namespace": "files", "root": str(self.root),
+                   "upgrade": False, "install_deps": False, "expected_public_keys": []}
+        account = SimpleNamespace(pw_dir=str(home), pw_uid=os.getuid(), pw_gid=os.getgid())
+        before = {str(p): p.read_bytes() for p in self.root.rglob("*") if p.is_file()}
+        is_dir = Path.is_dir
+        for upgrade in (False, True):
+            payload["upgrade"] = upgrade
+            encoded = base64.b64encode(json.dumps(payload).encode()).decode()
+            with patch("os.geteuid", return_value=0), patch("pwd.getpwnam", return_value=account), \
+                 patch("shutil.which", side_effect=lambda name: "/usr/bin/" + name), \
+                 patch.object(Path, "is_dir", lambda p: str(p) == "/run/systemd/system" or is_dir(p)), \
+                 patch("subprocess.run") as run:
+                with self.assertRaises(SystemExit):
+                    exec(INSTALL, {"PAYLOAD": encoded})
+                run.assert_not_called()
+            self.assertEqual(before, {str(p): p.read_bytes() for p in self.root.rglob("*") if p.is_file()})
 
 
 if __name__ == "__main__":

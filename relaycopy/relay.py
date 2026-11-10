@@ -84,6 +84,21 @@ class RelayStore:
         return {"namespace": self.namespace, "ttl_hours": self.policy["ttl_hours"],
                 "free_bytes": usage.free, "total_bytes": usage.total}
 
+    def forward_rsync(self, command):
+        """Leave option/path validation and the transfer protocol to rrsync."""
+        if command[:2] != ["rsync", "--server"] or self.policy.get("key_mode") != "unified":
+            raise RelayError("only restricted rsync server commands are allowed")
+        reading = "--sender" in command[2:]
+        options = ["-ro"] if reading else ["-wo", "-munge", "-no-del"]
+        root = self.root / "incoming"
+        if not reading:
+            root /= self.namespace
+        flock, rrsync = self.policy["flock"], self.policy["rrsync"]
+        if not all(isinstance(p, str) and p.startswith("/") for p in (flock, rrsync)):
+            raise RelayError("managed tool paths must be absolute")
+        # rrsync consumes SSH_ORIGINAL_COMMAND itself; never evaluate it as shell code.
+        os.execv(flock, [flock, "-s", str(self.root / "transfer.lock"), rrsync, *options, str(root)])
+
     def release(self, job, sha256):
         identifier(job)
         if not re.fullmatch("[a-f0-9]{64}", sha256):
@@ -185,7 +200,7 @@ def relay_main(argv):
     p = argparse.ArgumentParser(prog="relaycp _relay")
     p.add_argument("--root", required=True)
     p.add_argument("--namespace", required=True)
-    p.add_argument("action", choices=["serve", "gc"])
+    p.add_argument("action", choices=["serve", "dispatch", "gc"])
     a = p.parse_args(argv)
     store = RelayStore(a.root, a.namespace)
     try:
@@ -193,6 +208,8 @@ def relay_main(argv):
             result = store.gc()
         else:
             command = shlex.split(os.environ.get("SSH_ORIGINAL_COMMAND", ""))
+            if a.action == "dispatch" and command[:2] == ["rsync", "--server"]:
+                store.forward_rsync(command)
             if command == ["info"]:
                 result = store.info()
             elif command in (["gc"], ["gc-dry-run"]):

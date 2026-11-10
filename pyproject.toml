@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "relaycopy"
-version = "0.2.1"
+version = "0.3.0"
 description = "Resumable relay transfers with an scp-style interface"
 readme = "README.md"
 keywords = ["ssh", "rsync", "relay", "file-transfer", "agent-skills"]

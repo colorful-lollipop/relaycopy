@@ -12,7 +12,7 @@ in the user's configuration, never in this skill.
 If explicitly asked to deploy a relay, read [deployment guidance](references/deployment.md).
 Ordinary transfers use an existing configuration and do not create accounts.
 Managed profiles work with any existing source SSH alias; no per-source entry is
-needed. The source automatically receives only the dedicated write-only key.
+needed. The source automatically receives the dedicated restricted relay key (upload/read/cleanup).
 
 ```sh
 relaycp source-alias:/absolute/completed-file ./destination/
@@ -49,9 +49,11 @@ requires a new job, or prior explicitly configured retained mode. Cleanup errors
 are not download corruption: preserve the verified local file and retry with the
 same request to finish cleanup. `gc --dry-run` previews retention; `gc` applies
 the configured scope/TTL. Do not manually rm paths, users or keys.
-Do not pass a host management/read private key as `upload_key_file`.
+Only delegate the profile’s restricted relay key; never a host administrator key.
 
-v0.2 supports regular files from one source host to a local path, and explicit
+v0.3 supports regular files from one source host to a local path, and explicit
 `send`/`receive`. Multiple files require a destination directory.
 It is scp-style syntax, not SCP/SFTP wire compatibility; recursive copies and
-one-command reverse copies are not supported. Consult `relaycp --help` for flags.
+one-command reverse copies are not supported. Consult `relaycp --help` for flags. HTTP 403 requires the original URL/command
+and error: the transfer path uses SSH, so do not assume it means relay-key denial.
+See the project’s [troubleshooting guide](https://github.com/colorful-lollipop/relaycopy/blob/main/docs/TROUBLESHOOTING.md).

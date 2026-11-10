@@ -19,19 +19,32 @@ account or directory is rejected. This command does not modify global sshd or
 another account's keys. Setup needs root only once; payload and maintenance
 operations run as the dedicated unprivileged account.
 
-Private Ed25519 keys are generated on the local controller, mode 0600. Only
+One private Ed25519 key is generated on the local controller, mode 0600. Only
 public keys reach the relay. Host public keys are obtained through the existing
 authenticated administrator connection and pinned for subsequent connections.
 Local configuration is refused inside Git worktrees. Keep its entire directory
 private, including deployment receipts, and back it up through your normal
 private credential process, not a public repository.
 
-The account has three forced-command keys:
+The account has one `restrict` forced-command key. The dispatcher accepts:
 
 - Upload: shared `flock`, then `rrsync -wo -munge -no-del` in its namespace.
-- Read: shared `flock`, then `rrsync -ro` over that profile's incoming tree.
+- Download: shared `flock`, then `rrsync -ro` over that profile's incoming tree.
 - Maintenance: fixed namespace-scoped `info`, `release JOB SHA256`, `gc`,
-  `gc-dry-run`. No arbitrary command/path, shell, forwarding or PTY.
+  `gc-dry-run`.
+
+The dispatcher does not run arbitrary commands or parse the rsync protocol;
+rrsync retains responsibility for option/path validation. Shell, forwarding,
+PTY and arbitrary path deletion remain forbidden. The same key is delegated to
+sources, so they possess all three capabilities for this profile.
+
+To migrate an existing generated controller, run
+`setup-relay --ssh relay-admin --upgrade --apply`. Its recorded root/user/namespace
+and TTL are retained; current credentials must match the server's authorized
+keys. The old upload identity is reused as `relay_ed25519`. Original config and
+keys are moved to a private backup directory; old read/maintenance identities are
+revoked. Update other controllers before their next connection. A new deployment
+must choose a different user/root instead of replacing an existing deployment.
 
 A receiver releases a file only after local SHA256 verification and publication.
 Release checks matching file manifest and completion metadata, uses directory

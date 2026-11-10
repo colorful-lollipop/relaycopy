@@ -21,7 +21,7 @@ git clone https://github.com/colorful-lollipop/relaycopy.git
 cd relaycopy
 python3 scripts/build.py
 
-# One-time setup; creates an isolated account, scoped keys and retention timer.
+# One-time setup; creates an isolated account, one scoped key and retention timer.
 ./dist/relaycp.pyz setup-relay --ssh my-relay-admin --install-deps --apply
 
 # Thereafter: only your normal source SSH alias and local destination are needed.
@@ -38,10 +38,11 @@ an existing unmanaged account/directory. Distribution package installation
 requires `--install-deps`; no source packages are installed automatically.
 
 A single local `~/.config/relaycopy/config.json` holds relay connection details;
-upload, read and maintenance private keys stay beside it, mode 0600 in an
-owner-only directory. Setup refuses storage inside a Git working tree. The
-source receives **only the namespace-scoped, write-only upload key**, over SSH
-stdin. Never delegate a host administrator key. Public code contains no credentials.
+one `relay_ed25519` private key stays beside it, mode 0600 in an owner-only
+directory. Setup refuses storage inside a Git working tree. The source receives
+this same **restricted relay key**, over SSH stdin; it can upload, download and
+request scoped cleanup. Never delegate a host administrator key. Public code
+contains no credentials.
 
 For multiple people/teams, deploy distinct users/roots and keep credentials
 separate, e.g. `--user relaycopy-alice --root /srv/relaycopy-alice`. One profile
@@ -52,6 +53,18 @@ source configurations remain supported.
 Optionally install from the local checkout into your virtual environment with
 `python3 -m pip install .`, which provides the `relaycp` command. No PyPI release
 has been published. The zipapp has no third-party Python runtime dependencies.
+
+Upgrade an existing v0.2 controller and relay together:
+
+```sh
+./dist/relaycp.pyz setup-relay --ssh my-relay-admin --upgrade --apply
+```
+
+Upgrade verifies ownership against the existing local credentials and deployment
+receipt, preserves relay root/user/namespace/retention, and privately backs up the
+old configuration and keys. It reuses the old upload identity for the unified key;
+old standalone read/maintenance keys are revoked. Existing controllers need the
+new configuration. A fresh setup refuses to replace an already managed relay.
 
 ## File-level pipeline and cleanup
 
@@ -65,7 +78,7 @@ There is **no same-file streaming**, custom chunk protocol, or repeated reading
 of growing payloads. Partial files remain available for retry. Original source
 files are never removed. Only managed relay storage is reclaimed.
 
-The maintenance key accepts only fixed `info`, `release JOB SHA256`, `gc` and
+The same relay key accepts rsync plus fixed `info`, `release JOB SHA256`, `gc` and
 `gc-dry-run` operations on its configured namespace. It cannot run a shell,
 forward ports, or choose an arbitrary filesystem path. A release requires matching
 file manifest and completion metadata. A cleanup failure is reported, and the
@@ -135,7 +148,8 @@ python3 scripts/build.py
 Tests run real OpenSSH/rsync/rrsync on a random loopback port with generated keys;
 they never use production credentials. CI includes Python 3.10/3.12 and a
 checksum-pinned Gitleaks scan of all Git history. See [validation](docs/VALIDATION.md)
-and [contribution guidance](CONTRIBUTING.md).
+and [contribution guidance](CONTRIBUTING.md). For HTTP 403, installation or SSH
+failures, see [troubleshooting](docs/TROUBLESHOOTING.md).
 
 MIT license for original code. OpenSSH, rsync, rrsync and util-linux flock are
 external tools with their own licenses; no upstream binaries are vendored.

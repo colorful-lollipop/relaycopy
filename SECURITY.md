@@ -1,6 +1,6 @@
 # Security
 
-Supported release line: 0.2.x. This project has functional/adversarial tests and
+Supported release line: 0.3.x. This project has functional/adversarial tests and
 secret scanning; it has not had an independent security audit. Keep OpenSSH and
 rsync distribution packages patched.
 
@@ -12,12 +12,17 @@ in public issues. Ordinary bug reports should use redacted logs.
 
 - Administrator access is used only for explicit `setup-relay --apply`. It creates
   a separate Unix account/root and does not change global sshd or unrelated users.
-- Upload, read and maintenance keys are separate capabilities selected by SSH
-  authentication. Data transports use private ControlMasters; maintenance forbids
-  reusing an existing master authenticated with a different role.
-- A source receives only an explicitly configured, namespace-scoped upload key.
-  Someone controlling that source can use that capability; use separate profiles
-  for different trust groups. Administrator/read/maintenance keys stay local.
+- A single restricted key permits upload, download and scoped maintenance. A
+  forced-command dispatcher sends rsync requests to the distribution's rrsync;
+  it never evaluates the supplied command as shell code. Rsync cannot delete;
+  cleanup is provided only through the fixed namespace/job/digest operations.
+- The same key is delegated to a source. Someone controlling that source has
+  all three relay capabilities within this profile. Use separate Unix users,
+  roots and profiles for different trust groups. Administrator identities stay
+  local. Legacy three-key client configurations remain supported.
+- Upgrade requires both an administrator SSH connection and the existing
+  controller credentials to match the relay. Fresh setup refuses an existing
+  managed relay; it cannot silently replace another controller's keys.
 - Local private configuration must be outside Git. Secret keys have mode 0600,
   parent directories mode 0700. Public source/history and distribution artifacts
   must be scanned before publishing; .gitignore is only an additional guard.
