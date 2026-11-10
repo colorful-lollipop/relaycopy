@@ -1,6 +1,7 @@
 """Use OpenSSH and rsync without executing application commands on the relay."""
 
 import os
+import json
 import re
 import shlex
 import subprocess
@@ -11,6 +12,21 @@ from pathlib import Path
 from .common import RelayError, remote_path, secret_file
 
 
+def relay_action(endpoint, command, log):
+    ssh, host = ssh_args(endpoint)
+    # Forced-command capabilities are selected at authentication time. Reusing a
+    # master authenticated with a different key would silently select its role.
+    result = subprocess.run(ssh + ["-o", "ControlMaster=no", "-o", "ControlPath=none", host, shlex.join(command)], stdin=subprocess.DEVNULL,
+                            capture_output=True, timeout=120)
+    if result.returncode:
+        Path(log).write_bytes(result.stdout + result.stderr)
+        raise RelayError(f"relay maintenance failed; see {log}")
+    value = json.loads(result.stdout)
+    if not isinstance(value, dict):
+        raise RelayError("invalid relay maintenance response")
+    return value
+
+
 def ssh_args(endpoint):
     host = endpoint.get("host")
     if not isinstance(host, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@-]*", host):
@@ -18,6 +34,8 @@ def ssh_args(endpoint):
     cmd = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
            "-o", "ForwardAgent=no", "-o", "ConnectTimeout=15",
            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"]
+    if endpoint.get("config_file"):
+        cmd += ["-F", str(Path(endpoint["config_file"]).expanduser())]
     if "port" in endpoint:
         port = int(endpoint["port"])
         if not 1 <= port <= 65535:

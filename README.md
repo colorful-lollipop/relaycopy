@@ -1,181 +1,138 @@
 # RelayCopy
 
-**`relaycp compute:/data/result.tar.gz ./` — copy through a relay without
-installing a transfer client on the source yourself.**
+**`relaycp compute:/data/A.tar.gz compute:/data/B.tar.gz ./results/`**
 
-[中文说明](README.zh-CN.md)
+Copy remote files through your own relay using **OpenSSH, rsync and rrsync**.
+Install the CLI only on your local machine. It automatically delivers a small
+Python worker to the source using your existing SSH alias. Payload bytes travel
+source → relay → receiver, outside your source-control/bastion connection.
 
-RelayCopy is a small orchestration layer over **OpenSSH, rsync and rrsync**.
-It does not implement a new transfer protocol or run an application server.
-File bytes travel from the source to your relay and then to the receiver.
-The source SSH connection carries only the bootstrap and launch receipt.
+[中文说明](README.zh-CN.md) · [Relay setup](server/README.md) · [Security](SECURITY.md)
 
-```mermaid
-flowchart LR
-    C[Local relaycp] -->|SSH: small worker and launch| S[Source host]
-    S -->|rsync: file A, then file B| R[Relay: existing sshd + rrsync]
-    R -->|rsync: completed files only| C
-```
+## Quick start
 
-Features:
-
-- One-command remote-to-local copy using an existing SSH alias.
-- Automatic content-addressed Python zipapp delivery; no source-side pip/curl.
-- Optional delegation of a dedicated **write-only** upload key over SSH stdin.
-- File-level pipeline: download completed A while the source uploads B.
-- Resumable payloads, local job locks and source PID/start-time receipts.
-- Final size and SHA256 checks before atomic, non-overwriting publication.
-- JSON Lines output, reusable tickets, and a distributable Agent Skill.
-
-## Requirements and installation
-
-Linux source and receiver: Python >=3.10, OpenSSH client, rsync >=3.2.3.
-Relay: existing OpenSSH sshd, rsync >=3.2.3 and rrsync. There is no new listener.
-macOS/Windows/WSL interoperability is not yet tested; Linux is the supported v0.1
-environment. The old rsync bundled with macOS is not sufficient.
-
-Run from a checkout, without installing dependencies:
+Source/receiver: Linux, Python >=3.10, OpenSSH clients and rsync >=3.2.3.
+Managed relay: Debian/Ubuntu with systemd, Python >=3.10 and an existing trusted
+administrator SSH connection (root or passwordless sudo). Other distributions
+must have the dependencies preinstalled. macOS/Windows are not yet tested.
 
 ```sh
+git clone https://github.com/colorful-lollipop/relaycopy.git
+cd relaycopy
 python3 scripts/build.py
-./dist/relaycp.pyz --version
-./dist/relaycp.pyz --config /path/to/config.json doctor
+
+# One-time setup; creates an isolated account, scoped keys and retention timer.
+./dist/relaycp.pyz setup-relay --ssh my-relay-admin --install-deps --apply
+
+# Thereafter: only your normal source SSH alias and local destination are needed.
+./dist/relaycp.pyz compute:/data/A.tar.gz compute:/data/B.tar.gz ./results/
 ```
 
-Or install the local project into your preferred virtual environment:
+Use `--sudo` when the administrator SSH account requires passwordless sudo.
+Omit `--apply` to inspect a setup plan. Setup never changes global sshd settings,
+opens a new listener, or replaces another account's authorized_keys. It refuses
+an existing unmanaged account/directory. Distribution package installation
+requires `--install-deps`; no source packages are installed automatically.
+
+A single local `~/.config/relaycopy/config.json` holds relay connection details;
+upload, read and maintenance private keys stay beside it, mode 0600 in an
+owner-only directory. Setup refuses storage inside a Git working tree. The
+source receives **only the namespace-scoped, write-only upload key**, over SSH
+stdin. Never delegate a host administrator key. Public code contains no credentials.
+
+For multiple people/teams, deploy distinct users/roots and keep credentials
+separate, e.g. `--user relaycopy-alice --root /srv/relaycopy-alice`. One profile
+can use any SSH source alias; a separate source entry is no longer required.
+See `config.example.json` for a placeholder managed profile. Legacy explicit
+source configurations remain supported.
+
+Optionally install from the local checkout into your virtual environment with
+`python3 -m pip install .`, which provides the `relaycp` command. No PyPI release
+has been published. The zipapp has no third-party Python runtime dependencies.
+
+## File-level pipeline and cleanup
+
+1. Source uploads A using resumable rsync, then publishes its completion receipt.
+2. Receiver downloads and SHA256-verifies A while the source uploads B.
+3. Receiver atomically publishes A locally, then releases A's relay payload.
+4. A systemd timer checks every 15 minutes for stale jobs; default retention is
+   24 hours. An exclusive `flock` prevents GC while any managed rsync is active.
+
+There is **no same-file streaming**, custom chunk protocol, or repeated reading
+of growing payloads. Partial files remain available for retry. Original source
+files are never removed. Only managed relay storage is reclaimed.
+
+The maintenance key accepts only fixed `info`, `release JOB SHA256`, `gc` and
+`gc-dry-run` operations on its configured namespace. It cannot run a shell,
+forward ports, or choose an arbitrary filesystem path. A release requires matching
+file manifest and completion metadata. A cleanup failure is reported, and the
+local verification receipt records `cleanup_pending` for retry.
+
+Default managed profiles are **single-consumer**: successful verification
+releases that file, so another destination must start a fresh job. For intentional
+multiple receivers, set `cleanup_after_receive: false`; TTL retention still
+applies. Tickets locate data and grant no permissions.
 
 ```sh
-python3 -m pip install .
-relaycp --version
+relaycp gc --dry-run
+relaycp gc
 ```
 
-There is no published PyPI release. `dist/relaycp.pyz` is the distributable
-single-file CLI. Installation and packaging never modify SSH configuration.
+Retention prevents abandoned jobs from accumulating indefinitely during idle
+periods. It is not a hard disk quota: a large active batch can still exceed
+available space. Use a dedicated filesystem/OS quota for hard isolation. Long
+active transfers defer GC until a later timer run, rather than being deleted.
 
-## Configure once
-
-First provision an isolated relay account/tree using [relay setup](server/README.md).
-Give the receiver a read-only rsync key and each source a namespace-scoped
-write-only key. Credentials are not part of this repository or the Skill.
-
-Copy `config.example.json` to `~/.config/relaycopy/config.json` and edit it.
-The example delegates the local `upload_key_file` to the source automatically,
-pins `upload_known_hosts_file`, and uses the receiver's `relay-read` SSH alias.
-The delegated private key is stored on the source in an owner-only directory,
-mode 0600. It must **not** be your administrator or read key. Anyone controlling
-the source can use that upload capability within its allowed namespace.
-
-If a source already has a restricted upload key, omit `upload_key_file` and
-`upload_known_hosts_file` and use remote paths instead:
-
-```json
-"upload": {
-  "host": "relayuser@relay.example.org",
-  "port": 2222,
-  "key_file": "/data/relay/ssh/upload_key",
-  "known_hosts": "/data/relay/ssh/known_hosts",
-  "upload_root": "."
-}
-```
-
-All paths inside `upload` are evaluated **on the source** for a remote copy.
-`upload_key_file` and `upload_known_hosts_file` are evaluated on the local
-controller. No broad default SSH key is selected for delegation.
-
-For a relay read key restricted to `/srv/relaycopy/alice/incoming`, use
-`download_root: "."`; tickets include the source namespace. An administrator
-reusing an existing unrestricted SSH alias may instead specify an absolute
-`download_root`. Shared users should receive restricted read credentials.
-
-## Copy and resume
+## Resume and agent handoff
 
 ```sh
-relaycp compute:/data/result.tar.gz ./
-relaycp 'compute:/data/results with spaces.tar.gz' ./renamed.tar.gz
-relaycp compute:/data/A.tar.gz compute:/data/B.tar.gz ./results/
+relaycp compute:/data/A.tar.gz ./ --id rc-PREVIOUS_ID
+relaycp status relay://files/rc-PREVIOUS_ID
+relaycp receive relay://files/rc-PREVIOUS_ID ./
 ```
 
-The first JSON event prints a random job ID and ticket. The controller uploads a
-small worker, starts it detached, and records its PID, `/proc` start ticks, bundle
-SHA256 and log path. It does not leave the source-control SSH channel running.
-The worker hashes an already-finished regular source file before upload.
+Keep the first JSON event's job ID/ticket, local state directory and source
+process receipt. The worker detaches after bootstrap; stopping the local CLI may
+leave the uploader running. Rerun with the same source, destination, profile and
+ID. Completed source files are not uploaded again when a batch resumes. A
+released/expired payload needs a new job ID if copying to a new destination.
 
-For each file, the relay receives `manifest.json`, `payload`, and then
-`complete.json`. The receiver waits for that file's completion receipt before
-requesting its payload, then downloads it once using resumable rsync. In a batch,
-it downloads completed A while the source uploads B. There is no same-file
-streaming, custom chunk protocol or repeated polling of payload contents. Final
-publication requires the completion receipt **and** SHA256 verification.
+Only `verified` proves one local file is complete; `batch_verified` proves the
+whole batch is complete. `relay_released` confirms relay payload removal. Relay
+`status: complete` proves upload completion, while `incomplete` does not establish
+worker liveness. Inspect the recorded source log/state on failure. A local
+SHA256 mismatch or conflicting destination is rejected without overwriting it.
 
-If interrupted, rerun the same copy with its recorded ID:
-
-```sh
-relaycp compute:/data/result.tar.gz ./ --id rc-THE_PREVIOUS_ID
-```
-
-This reuses an identified running worker or restarts it with the same input.
-Keep the local state directory and source worker directory. Do not reuse an ID
-for new content or clear the source state and then reuse an old ID. The source
-may continue uploading after the local controller is interrupted.
-
-To hand a task to another agent or receive on another machine:
-
-```sh
-relaycp status relay://compute/rc-THE_PREVIOUS_ID
-relaycp receive relay://compute/rc-THE_PREVIOUS_ID ./
-```
-
-A ticket locates data; it grants no permissions. A receiver must have its own
-authorized read credential. `status: incomplete` means no completion receipt was
-found; it is not evidence that a worker is still running. Inspect the recorded
-source log/state if a sender fails. Receiver authentication errors fail immediately;
-missing upload receipts are followed up to `--wait-seconds` (default 3600).
-
-For an explicit upload from the current machine, configure `profiles.default.upload`
-and `namespace`, then use `relaycp send FILE [FILE ...]`. Another machine can receive its
-ticket. Source files and relay copies are never automatically deleted.
-
-## Compatibility and limits
-
-- This CLI accepts a useful **scp-style syntax subset**: regular files from one remote host
-  to a local directory, or one file to a local filename. It is not the SCP/SFTP wire protocol or a drop-in replacement
-  for every scp flag. Native `scp` cannot use a forced-rsync key.
-- v0.1 does not implement recursive copies, globs, local-to-remote one-command
-  copies, remote-to-remote copies, a daemon, automatic cleanup, or quota management.
-- The source must remain unchanged. Symlinks and devices are rejected.
-- Both network legs can overlap but share bandwidth and relay disk I/O. No
-  guaranteed speedup is claimed. `--bwlimit` caps source upload in KiB/s.
-- The relay retains the **whole files** in a batch. It needs space for the batch
-  and does not provide a bounded streaming cache. Single-file download starts
-  only after upload completes; file-level overlap needs at least two files.
-- The first release uses random job IDs plus local locks, not a distributed lock
-  service. Use one owner per upload namespace; protect the relay storage from
-  unrelated writers and never reuse IDs for different data.
-- SHA256 detects transfer corruption against the sender's manifest; it does not
-  establish that an authorized sender supplied trustworthy content.
+Paths with spaces must be quoted. The CLI supports ordinary completed files
+from one source host per invocation, plus explicit local `send` / `receive`.
+It accepts an **scp-style syntax subset**, not the SCP/SFTP wire protocol. Native
+scp cannot use forced-rsync keys. Recursive copies, globs and one-command
+local-to-remote/remote-to-remote copies are not implemented.
 
 ## Agent Skill
 
-Distribute `skills/relaycopy/` with the CLI. For Codex, copy it into the consuming
-project's `.agents/skills/`. Other harnesses can use their supported skill location
-or explicitly read `SKILL.md` before invoking the same CLI. CLI versions are
-pinned by the distributed artifact; no agent-specific SDK is needed.
+Give your agent `skills/relaycopy/SKILL.md` and a trusted administrator SSH alias:
+
+> Deploy a RelayCopy relay using my-relay-admin, save the private config locally,
+> then copy compute:/data/A.tar.gz into this directory.
+
+For Codex, install `skills/relaycopy/` under the consuming project's
+`.agents/skills/`. Other harnesses can use their skill location or read SKILL.md
+explicitly. The same CLI works without an agent SDK or MCP service. Setup needs
+explicit deployment authorization; ordinary transfers do not provision accounts.
 
 ## Development
 
 ```sh
-python3 -m unittest tests.test_unit -v
+python3 -m unittest tests.test_unit tests.test_relay -v
 RELAYCP_INTEGRATION=1 python3 -m unittest tests.test_integration -v
 python3 scripts/build.py
 ```
 
-Integration tests start their own sshd on a random loopback port and use generated
-ephemeral keys, real rsync, and real forced-command rrsync. They never contact an
-external server. See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
+Tests run real OpenSSH/rsync/rrsync on a random loopback port with generated keys;
+they never use production credentials. CI includes Python 3.10/3.12 and a
+checksum-pinned Gitleaks scan of all Git history. See [validation](docs/VALIDATION.md)
+and [contribution guidance](CONTRIBUTING.md).
 
-## License and upstream tools
-
-RelayCopy's original code is MIT licensed. OpenSSH, rsync and rrsync are invoked as
-external programs and retain their own licenses; their source/binaries are not
-vendored. The orchestration relies on the official [rsync append-verify behavior](https://download.samba.org/pub/rsync/rsync.1)
-and [rrsync restrictions](https://download.samba.org/pub/rsync/rrsync.1).
+MIT license for original code. OpenSSH, rsync, rrsync and util-linux flock are
+external tools with their own licenses; no upstream binaries are vendored.

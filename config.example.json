@@ -1,22 +1,28 @@
 {
   "version": 1,
+  "state_dir": "~/.config/relaycopy/state",
   "profiles": {
     "default": {
-      "relay": {"host": "relay-read"},
-      "download_root": "."
-    }
-  },
-  "sources": {
-    "compute": {
-      "host": "compute",
-      "namespace": "compute",
-      "remote_dir": "~/.cache/relaycopy",
-      "upload_key_file": "~/.config/relaycopy/compute-upload",
-      "upload_known_hosts_file": "~/.config/relaycopy/relay_known_hosts",
-      "upload": {
-        "host": "relayuser@relay.example.org",
+      "namespace": "files",
+      "download_root": ".",
+      "cleanup_after_receive": true,
+      "relay": {
+        "host": "relaycopy@relay.example.org",
         "port": 2222,
-        "upload_root": "."
+        "key_file": "~/.config/relaycopy/read_ed25519",
+        "known_hosts": "~/.config/relaycopy/known_hosts"
+      },
+      "upload": {
+        "host": "relaycopy@relay.example.org",
+        "port": 2222,
+        "key_file": "~/.config/relaycopy/upload_ed25519",
+        "known_hosts": "~/.config/relaycopy/known_hosts"
+      },
+      "cleanup": {
+        "host": "relaycopy@relay.example.org",
+        "port": 2222,
+        "key_file": "~/.config/relaycopy/cleanup_ed25519",
+        "known_hosts": "~/.config/relaycopy/known_hosts"
       }
     }
   }

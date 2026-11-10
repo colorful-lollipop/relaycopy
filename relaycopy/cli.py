@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 from .bootstrap import launch
 from .common import RelayError, VERSION, atomic_json, emit, identifier, join_remote, read_json
 from .transfer import pull, push_many, status
+from .transport import relay_action
 
 
 def parser():
@@ -22,7 +23,7 @@ def parser():
     p.add_argument("--config", default=os.environ.get("RELAYCP_CONFIG", "~/.config/relaycopy/config.json"))
     p.add_argument("--profile", default="default")
     p.add_argument("--json", action="store_true", help="stdout is always JSON Lines; accepted for automation")
-    sub = p.add_subparsers(dest="command", required=True, metavar="{copy,send,receive,status,doctor}")
+    sub = p.add_subparsers(dest="command", required=True, metavar="{copy,send,receive,status,doctor,setup-relay,gc}")
     copy = sub.add_parser("copy", help="one-command remote-to-local copy; 'copy' may be omitted")
     copy.add_argument("sources", nargs="+", help="one or more SSH-source-alias:/absolute/path on the same host")
     copy.add_argument("dest", help="local file or directory")
@@ -41,6 +42,19 @@ def parser():
     st = sub.add_parser("status", help="query relay receipts without running commands on the relay")
     st.add_argument("ticket")
     sub.add_parser("doctor", help="check local prerequisites and configuration; no network changes")
+    gc = sub.add_parser("gc", help="expire inactive relay jobs using the configured retention policy")
+    gc.add_argument("--dry-run", action="store_true")
+    setup = sub.add_parser("setup-relay", help="deploy an isolated SSH/rsync relay and save local credentials")
+    setup.add_argument("--ssh", required=True, help="existing trusted administrator SSH alias")
+    setup.add_argument("--root", default="/srv/relaycopy")
+    setup.add_argument("--user", default="relaycopy")
+    setup.add_argument("--namespace", default="files")
+    setup.add_argument("--ttl-hours", type=float, default=24)
+    setup.add_argument("--config-output", default="~/.config/relaycopy/config.json")
+    setup.add_argument("--relay-address", help="source-reachable hostname/IP, if different from the administrator alias")
+    setup.add_argument("--sudo", action="store_true")
+    setup.add_argument("--install-deps", action="store_true", help="allow signed distribution package installation on the relay")
+    setup.add_argument("--apply", action="store_true", help="create the dedicated account, restricted keys and retention timer")
     worker = sub.add_parser("_worker")
     worker.add_argument("request")
     return p
@@ -53,7 +67,7 @@ def waiting(p):
 
 def normalize(argv):
     # Preserve ordinary scp-style positional invocation without a second CLI.
-    commands = {"copy", "send", "receive", "status", "doctor", "_worker"}
+    commands = {"copy", "send", "receive", "status", "doctor", "_worker", "setup-relay", "gc"}
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -79,6 +93,8 @@ def config(args):
         raise RelayError("profile needs a relay SSH endpoint")
     state = Path(data.get("state_dir", "~/.local/state/relaycopy")).expanduser()
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if state.is_symlink() or state.stat().st_uid != os.getuid() or state.stat().st_mode & 0o022:
+        raise RelayError("state directory must be owned by this user and not group/world writable")
     return data, profile, state
 
 
@@ -90,7 +106,12 @@ def ticket_parts(ticket):
 
 
 def reader(profile, namespace):
-    return {**profile["relay"], "download_root": join_remote(profile.get("download_root", "."), namespace)}
+    value = {**profile["relay"], "download_root": join_remote(profile.get("download_root", "."), namespace)}
+    if profile.get("cleanup_after_receive"):
+        if profile.get("namespace") != namespace or not profile.get("cleanup"):
+            raise RelayError("automatic cleanup is only allowed in the configured managed namespace")
+        value["cleanup"] = profile["cleanup"]
+    return value
 
 
 def destination(value):
@@ -101,6 +122,12 @@ def destination(value):
 
 
 def run(args):
+    if args.command == "setup-relay":
+        from .deploy import setup
+        if not 1 <= args.ttl_hours <= 8760:
+            raise RelayError("--ttl-hours must be between 1 and 8760")
+        setup(args)
+        return
     if args.command == "_worker":
         def terminate(_signal, _frame):
             raise KeyboardInterrupt
@@ -115,6 +142,12 @@ def run(args):
             raise
         return
     data, profile, state = config(args)
+    if args.command == "gc":
+        if not profile.get("cleanup"):
+            raise RelayError("profile has no scoped maintenance credential")
+        result = relay_action(profile["cleanup"], ["gc-dry-run" if args.dry_run else "gc"], state / "gc.log")
+        emit("gc", **result)
+        return
     if args.command == "doctor":
         available = {tool: shutil.which(tool) for tool in ("ssh", "rsync")}
         if not all(available.values()):
@@ -155,7 +188,16 @@ def run(args):
         raise RelayError("multiple source files require a destination directory")
     source = data.get("sources", {}).get(alias)
     if not isinstance(source, dict):
-        raise RelayError(f"source {alias!r} is not configured; add its SSH alias and existing upload endpoint")
+        endpoint = profile.get("upload")
+        if not endpoint or not endpoint.get("key_file") or not endpoint.get("known_hosts"):
+            raise RelayError(f"source {alias!r} needs a managed profile or explicit source configuration")
+        source = {"namespace": profile.get("namespace", "files"),
+                  "remote_dir": profile.get("remote_dir", "~/.cache/relaycopy"),
+                  "upload_key_file": endpoint["key_file"],
+                  "upload_known_hosts_file": endpoint["known_hosts"],
+                  "upload": {k: v for k, v in endpoint.items() if k not in ("key_file", "known_hosts")}}
+        if data.get("ssh_config"):
+            source["ssh"] = {"host": alias, "config_file": data["ssh_config"]}
     source = {"host": alias, **source}
     namespace = identifier(source["namespace"])
     ticket = f"relay://{namespace}/{job}"
@@ -176,7 +218,16 @@ def run(args):
 
 
 def main(argv=None):
-    args = parser().parse_args(normalize(list(sys.argv[1:] if argv is None else argv)))
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "_relay":
+        try:
+            from .relay import relay_main
+            relay_main(argv[1:])
+            return 0
+        except (RelayError, OSError, ValueError, KeyError) as exc:
+            emit("error", error_type=type(exc).__name__, message=str(exc))
+            return 1
+    args = parser().parse_args(normalize(argv))
     if hasattr(args, "poll") and (args.poll < 0.1 or args.wait_seconds < 0):
         parser().error("--poll must be >=0.1 and --wait-seconds must be >=0")
     if getattr(args, "bwlimit", None) is not None and args.bwlimit <= 0:

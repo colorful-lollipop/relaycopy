@@ -92,7 +92,10 @@ with (work / "launch.lock").open("a") as lock:
         try:
             ticks = proc.joinpath("stat").read_text().rsplit(")", 1)[1].split()[19]
             cmd = proc.joinpath("cmdline").read_bytes().split(b"\0")
-            if ticks == previous["start_ticks"] and str(tool).encode() in cmd and b"_worker" in cmd:
+            old_sha = previous.get("bundle_sha256", "")
+            old_tool = str(base / ("relaycp-" + old_sha + ".pyz"))
+            valid_sha = len(old_sha) == 64 and all(c in "0123456789abcdef" for c in old_sha)
+            if valid_sha and previous.get("tool") == old_tool and ticks == previous["start_ticks"] and old_tool.encode() in cmd and b"_worker" in cmd:
                 print(json.dumps(dict(previous, already_running=True)))
                 raise SystemExit(0)
         except (FileNotFoundError, ProcessLookupError):

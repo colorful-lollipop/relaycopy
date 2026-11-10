@@ -1,71 +1,79 @@
-# RelayCopy：透明的 SSH/rsync 中转复制
+# RelayCopy：让 agent 透明地中转复制文件
 
-命令叫 **`relaycp`**。只在本地安装，首次通过现有 SSH 自动向源机器投递小型
-Python zipapp；文件从源机器直接上传到中转机，多个文件之间可以流水传输。
-不在 A5 上安装 Python 包，不经过堡垒机传文件内容，不新增服务或公网端口。
+命令叫 **`relaycp`**。只在本地安装，复用已有 SSH 别名连接源机器，自动投递小工具和
+专用只写上传凭据；数据从源机器经中转机到本地，不通过堡垒机传文件内容。
+底层复用 OpenSSH、rsync、rrsync、flock，不自研传输协议或新增网络监听。
+
+## 一次部署，以后只留本地配置
 
 ```sh
+git clone https://github.com/colorful-lollipop/relaycopy.git
+cd relaycopy
 python3 scripts/build.py
-./dist/relaycp.pyz --config /自己的/config.json doctor
-./dist/relaycp.pyz --config /自己的/config.json compute:/data/result.tar.gz ./
+
+# my-relay-admin 是你已有且已验证主机身份的管理员 SSH 别名
+./dist/relaycp.pyz setup-relay --ssh my-relay-admin --install-deps --apply
+
+# 此后直接使用已有的源机器 SSH 别名，无需逐台填写上传配置
+./dist/relaycp.pyz compute:/data/A.tar.gz compute:/data/B.tar.gz ./results/
 ```
 
-底层复用 OpenSSH、rsync 和 rrsync。项目只封装工具投递、启动、状态与完整性验收。
-客户端和源机器要求 Linux、Python 3.10+、OpenSSH 和 rsync 3.2.3+。
-中转机只需已有 sshd、rsync、rrsync。
+管理员登录非root时可加 `--sudo`，需要免交互sudo。省略 `--apply` 可查看计划。
+中转部署要求 Linux、Python 3.10+、systemd；自动安装依赖支持 Debian/Ubuntu。
+本地和源机器要求 Python 3.10+、OpenSSH、rsync 3.2.3+；不会自动在源机器安装包。
 
-## 一次配置后使用
+部署创建独立账号、数据目录、受限凭据和回收定时任务，不改全局sshd配置、不覆盖
+其他账号authorized_keys、不增加公网端口。默认配置保存在
+`~/.config/relaycopy/config.json`，三把私钥在同一私有目录中以0600保存。
+部署工具拒绝把配置和私钥写到任何Git工作区内。
 
-1. 管理员按 [中转设置](server/README.md) 建立独立接收目录、受限只写上传 key
-   和只读下载 key。每个同事/团队使用自己的凭据与目录，不分发主机管理 key。
-2. 本地配置 `config.example.json` 中的中转 SSH 别名、来源机器 SSH 别名和 namespace。
-3. 可以配置本地 `upload_key_file` 和已认证的 `upload_known_hosts_file`，首次自动
-   通过 SSH stdin 投递到源机器，0600 保存；仅能使用已被服务端限制的专用上传 key。
-4. 如果 A5 已经有受限上传 key，省略上面两个字段，在 `upload` 中填源机器上现有
-   `key_file`、`known_hosts`，直接复用，无需复制私钥。
+上传、下载、维护使用不同密钥。只有受限只写上传key会下发到源机器；本机管理SSH身份
+不下发、不写进源码或Skill。不同同事/团队应分别部署账号、目录和凭据。
 
-源端 `upload.host` 应填写源机器实际可访问的地址；本地的 SSH 别名不一定在源端存在。
-同事只需获得文件权限，不需要 guan 的 shell 权限。Skill 不承担权限隔离。
+## 文件级流水与空间回收
 
-## 操作与交接
+- A上传完成后才下载A，同时源端继续上传B。
+- 本地大小和SHA256通过、正式文件发布成功后，立即释放A的中转副本。
+- 遗留任务默认保留24小时，systemd每15分钟检查；拿不到独占锁就跳过，保护活跃rsync。
+- 原始文件不删除；失败partial保留供续传。清理失败会报错并保留待清理回执。
+
+维护key只能访问固定namespace下的固定维护操作，不能执行shell、端口转发或指定任意路径。
+任务ID、完成回执及SHA必须匹配才能释放对应文件。不会扫描或清理其他用户目录。
+
+默认是**单次接收后释放**。需要同一份文件给多个接收方时，把配置里的
+`cleanup_after_receive` 设为false，由保留期统一回收；ticket本身不授予访问权限。
+这不是硬磁盘配额：活跃的大批量传输仍可能占满盘，建议配独立文件系统或OS配额。
 
 ```sh
-# 一条命令；源文件必须已经写完
-relaycp compute:/data/result.tar.gz ./
-
-# 路径有空格时正常引用；本地可以改名
-relaycp 'compute:/data/result with spaces.tar.gz' ./renamed.tar.gz
-
-# A 上传完成后下载 A，同时上传 B
-relaycp compute:/data/A.tar.gz compute:/data/B.tar.gz ./results/
-
-# 使用首次输出的 ID 恢复同一个任务
-relaycp compute:/data/result.tar.gz ./ --id rc-首次的ID
-
-# 把 ticket 交给其他 agent 或其他接收机器
-relaycp status relay://compute/rc-首次的ID
-relaycp receive relay://compute/rc-首次的ID ./
+relaycp gc --dry-run
+relaycp gc
 ```
 
-stdout 固定输出 JSON Lines，供 agent 解析。首次输出 ticket、resume_id，随后给出
-源端 PID/start_ticks、工具 SHA 和日志位置。工具传完即断开控制 SSH；上传后台运行。
-中断本地下载不会自动停止源端上传。
+## 恢复与交接
 
-接收方先得到 `.partial.relaycp`，整文件大小与 SHA256 验证通过后，才以不覆盖的方式
-发布正式文件，并写入 `.relaycp-verified.json`。保留 partial、sidecar 和状态目录可续传。
-已有目标文件一致则跳过，不一致则拒绝覆盖。
+```sh
+relaycp compute:/data/A.tar.gz ./ --id rc-首次的ID
+relaycp status relay://files/rc-首次的ID
+relaycp receive relay://files/rc-首次的ID ./
+```
 
-## 实现边界
+stdout是JSON Lines。`verified`表示单文件本地校验完成，`batch_verified`表示整批完成，
+`relay_released`表示中转副本已释放。保存首次输出的ID、ticket和源端进程回执。
+中断本地进程不一定停止远端上传；恢复时保留partial、sidecar和状态目录。
+同一ID不用于不同内容。已释放或过期的文件复制到新目的地时，应创建新任务。
 
-这是 **scp 风格的一部分语法**，不是原生 SCP/SFTP 协议，也不替换系统 scp。
-v0.1 支持同一远程机器的一个或多个普通文件到本地；递归、glob、一条命令反向上传和远程对远程尚未实现。
-可用 `send`/`receive` 在具备相应受限凭据的机器之间显式交接。
+当前支持同一远程机器的多个普通文件；可用 `send` / `receive` 显式交接。
+这是scp风格语法，不是原生SCP/SFTP协议；目录递归、glob和一键反向复制尚未实现。
 
-仅做文件级流水：A 上传完成后下载 A，同时源端上传 B。单文件不边传边取、不反复读取
-增长文件；下载使用一次可续传的 rsync，最终核对 SHA256。等待期间只查小型完成回执。
-速度收益取决于两段链路和磁盘；中转机仍需容纳这批完整文件。
-不自动清理源文件或中转数据，不提供配额系统；由管理员按存储容量配置隔离和保留策略。
+## 交给 agent
 
-分发 `skills/relaycopy/` 给其他 agent；支持 Skill 的 harness 安装到其约定位置，
-其他能执行命令的 agent 可以直接读取同一份 SKILL.md。详细配置、测试与限制见
-[English README](README.md)。
+把 `skills/relaycopy/` 交给agent，并告诉它已有管理员SSH别名，例如：
+
+> 使用 relaycopy Skill，通过 my-relay-admin 部署中转，把私有配置留在本地，然后把
+> compute:/data/A.tar.gz 下载到当前目录。
+
+支持Skill的harness按其位置安装；其他能执行命令的agent可直接读取同一SKILL.md。
+后续只需让agent使用已有配置，不需要再次部署中转。
+
+详细参数、测试、MIT许可证和安全边界见 [English README](README.md)、
+[部署说明](server/README.md) 和 [安全说明](SECURITY.md)。

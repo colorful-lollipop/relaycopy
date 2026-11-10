@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .common import (RelayError, atomic_json, digest, emit, fingerprint, identifier,
                      join_remote, locked, make_manifest, now, read_json, validate_manifest)
-from .transport import Rsync
+from .transport import Rsync, relay_action
 
 
 def push(source, job, relay, work, bwlimit=None, _transport=None):
@@ -23,6 +23,15 @@ def push(source, job, relay, work, bwlimit=None, _transport=None):
         if path.exists() and read_json(path) != manifest:
             raise RelayError("job already belongs to different content; use a new job ID")
         atomic_json(path, manifest)
+        completed = work / "complete.json"
+        # Keep previously released files released when a batch resumes at a later file.
+        if completed.exists() and (work / "uploaded.json").exists():
+            done = read_json(completed)
+            if done.get("sha256") != manifest["sha256"] or done.get("bytes") != manifest["bytes"]:
+                raise RelayError("local completion receipt differs")
+            atomic_json(work / "state.json", {"status": "complete", **done})
+            emit("upload_already_complete", **done)
+            return done
         root = join_remote(relay.get("upload_root", "."), job)
         with (nullcontext(_transport) if _transport else Rsync(relay, work / "rsync.log")) as transport:
             try:
@@ -44,6 +53,7 @@ def push(source, job, relay, work, bwlimit=None, _transport=None):
                 atomic_json(work / "state.json", {**failure, "status": "failed"})
                 raise
         atomic_json(work / "state.json", {"status": "complete", **done})
+        atomic_json(work / "uploaded.json", done)
         emit("upload_complete", **done)
         return done
 
@@ -94,6 +104,19 @@ def pull(job, relay, dest, cache, *, follow=True, wait_seconds=3600, poll=5, out
     root = join_remote(relay.get("download_root", "."), job)
     deadline = time.monotonic() + wait_seconds
 
+    def finish(record, final):
+        if relay.get("cleanup"):
+            receipt = final.with_name(final.name + ".relaycp-verified.json")
+            atomic_json(receipt, {**record, "cleanup_pending": True})
+            released = relay_action(relay["cleanup"], ["release", job, record["sha256"]], cache / "cleanup.log")
+            if released.get("job") != job or released.get("sha256") != record["sha256"]:
+                raise RelayError("relay release receipt differs; local file is verified")
+            record["relay_released"] = True
+            atomic_json(receipt, record)
+            emit("relay_released", **released)
+        emit("verified", **record)
+        return record
+
     def wait():
         if not follow:
             raise RelayError("upload not complete; use --follow or retry after the sender completes")
@@ -105,6 +128,10 @@ def pull(job, relay, dest, cache, *, follow=True, wait_seconds=3600, poll=5, out
         while (manifest := fetch_json(transport, root, "manifest.json", cache)) is None:
             wait()
         validate_manifest(manifest, job)
+        previous = cache / "manifest.json"
+        if previous.exists() and read_json(previous) != manifest:
+            raise RelayError("manifest changed; refusing to mix different content")
+        atomic_json(previous, manifest)
         if manifest.get("kind") == "batch":
             if output:
                 raise RelayError("multiple files need a destination directory, ending in / or already existing")
@@ -123,10 +150,6 @@ def pull(job, relay, dest, cache, *, follow=True, wait_seconds=3600, poll=5, out
             return record
         if _expected_name is not None and manifest["name"] != _expected_name:
             raise RelayError("file manifest name differs from batch manifest")
-        previous = cache / "manifest.json"
-        if previous.exists() and read_json(previous) != manifest:
-            raise RelayError("manifest changed; refusing to mix old partial data with new content")
-        atomic_json(previous, manifest)
         # File-level pipeline: no payload request while the source is uploading.
         while (done := fetch_json(transport, root, "complete.json", cache)) is None:
             emit("waiting_for_upload", job=job)
@@ -142,8 +165,9 @@ def pull(job, relay, dest, cache, *, follow=True, wait_seconds=3600, poll=5, out
             if not final.is_file() or final.stat().st_size != manifest["bytes"] or digest(final) != manifest["sha256"]:
                 raise RelayError("existing destination differs; refusing to overwrite")
             record = {"job": job, "local": str(final), "bytes": manifest["bytes"], "sha256": manifest["sha256"], "already_verified": True}
-            emit("verified", **record)
-            return record
+            return finish(record, final)
+        if fetch_json(transport, root, "released.json", cache) is not None:
+            raise RelayError("relay payload was already released after verification; start a new copy with a new job ID")
         final.parent.mkdir(parents=True, exist_ok=True)
         part = final.with_name(final.name + ".partial.relaycp")
         sidecar = part.with_name(part.name + ".json")
@@ -153,6 +177,8 @@ def pull(job, relay, dest, cache, *, follow=True, wait_seconds=3600, poll=5, out
                 raise RelayError("partial destination belongs to a different transfer")
             if part.is_symlink() or (part.exists() and not stat.S_ISREG(part.lstat().st_mode)):
                 raise RelayError("partial destination must be a regular file")
+            if part.exists() and part.stat().st_nlink != 1:
+                raise RelayError("partial destination must not be a hard link")
             atomic_json(sidecar, identity)
             transport.copy(part, root + "/payload", max_bytes=manifest["bytes"])
             current = part.stat().st_size
@@ -163,8 +189,7 @@ def pull(job, relay, dest, cache, *, follow=True, wait_seconds=3600, poll=5, out
             record = {"job": job, "local": str(final), "bytes": manifest["bytes"], "sha256": manifest["sha256"], "verified_at": now()}
             atomic_json(final.with_name(final.name + ".relaycp-verified.json"), record)
             sidecar.unlink()
-            emit("verified", **record)
-            return record
+            return finish(record, final)
 
 
 def status(job, relay, cache):
@@ -173,7 +198,7 @@ def status(job, relay, cache):
     cache.mkdir(parents=True, exist_ok=True, mode=0o700)
     root = join_remote(relay.get("download_root", "."), job)
     with locked(cache / "download.lock"), Rsync(relay, cache / "rsync.log") as transport:
-        for name, state in (("complete.json", "complete"), ("manifest.json", "incomplete")):
+        for name, state in (("released.json", "released"), ("complete.json", "complete"), ("manifest.json", "incomplete")):
             value = fetch_json(transport, root, name, cache)
             if value is not None:
                 if name == "manifest.json":

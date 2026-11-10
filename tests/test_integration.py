@@ -18,7 +18,8 @@ import unittest
 from pathlib import Path
 
 from relaycopy.common import RelayError, atomic_json, digest, read_json
-from relaycopy.transport import Rsync, ssh_args
+from relaycopy.transport import Rsync, ssh_args, relay_action
+from relaycopy.bootstrap import bundle
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -33,11 +34,17 @@ class SSHIntegration(unittest.TestCase):
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             cls.port = sock.getsockname()[1]
-        cls.relay = cls.base / "relay"
+        cls.managed = cls.base / "managed"
+        cls.relay = cls.managed / "incoming"
         (cls.relay / "compute").mkdir(parents=True)
+        (cls.managed / "releases").mkdir()
+        (cls.managed / "transfer.lock").touch(mode=0o600)
+        atomic_json(cls.managed / "managed.json", {"version": 1, "namespace": "compute", "ttl_hours": 24})
+        cls.bundle = cls.base / "relaycp.pyz"
+        cls.bundle.write_bytes(bundle())
         cls.tools = cls.base / "tools"
         cls.keys = {}
-        for name in ("host", "source", "upload", "read"):
+        for name in ("host", "source", "upload", "read", "cleanup"):
             key = cls.base / (name + "_key")
             subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)], check=True)
             cls.keys[name] = key
@@ -47,10 +54,12 @@ class SSHIntegration(unittest.TestCase):
         auth = cls.base / "authorized_keys"
         auth.write_text(
             "restrict " + cls.keys["source"].with_suffix(".pub").read_text()
-            + f'restrict,command="/usr/bin/rrsync -wo -munge -no-del {cls.relay}/compute" '
+            + f'restrict,command="/usr/bin/flock -s {cls.managed}/transfer.lock /usr/bin/rrsync -wo -munge -no-del {cls.relay}/compute" '
             + cls.keys["upload"].with_suffix(".pub").read_text()
-            + f'restrict,command="/usr/bin/rrsync -ro {cls.relay}" '
+            + f'restrict,command="/usr/bin/flock -s {cls.managed}/transfer.lock /usr/bin/rrsync -ro {cls.relay}" '
             + cls.keys["read"].with_suffix(".pub").read_text()
+            + f'restrict,command="{sys.executable} {cls.bundle} _relay --root {cls.managed} --namespace compute serve" '
+            + cls.keys["cleanup"].with_suffix(".pub").read_text()
         )
         cfg = cls.base / "sshd_config"
         cfg.write_text(f"Port {cls.port}\nListenAddress 127.0.0.1\nHostKey {cls.keys['host']}\n"
@@ -72,7 +81,10 @@ class SSHIntegration(unittest.TestCase):
                 time.sleep(0.1)
         cls.endpoints = {name: {"host": f"{cls.user}@127.0.0.1", "port": cls.port,
                                "key_file": str(cls.keys[name]), "known_hosts": str(cls.known)}
-                         for name in ("source", "upload", "read")}
+                         for name in ("source", "upload", "read", "cleanup")}
+        cls.ssh_config = cls.base / "ssh_config"
+        cls.ssh_config.write_text(f"Host compute\n HostName 127.0.0.1\n User {cls.user}\n Port {cls.port}\n"
+                                  f" IdentityFile {cls.keys['source']}\n IdentitiesOnly yes\n UserKnownHostsFile {cls.known}\n")
         cls.config = cls.base / "config.json"
         atomic_json(cls.config, {
             "version": 1, "state_dir": str(cls.base / "state"),
@@ -100,8 +112,8 @@ class SSHIntegration(unittest.TestCase):
         cls.server_log.close()
         cls.temp.cleanup()
 
-    def cli(self, *args, check=True):
-        p = subprocess.run([sys.executable, "-m", "relaycopy", "--config", str(self.config), *map(str, args)],
+    def cli(self, *args, check=True, config=None):
+        p = subprocess.run([sys.executable, "-m", "relaycopy", "--config", str(config or self.config), *map(str, args)],
                            cwd=ROOT, capture_output=True, text=True, timeout=45)
         if check and p.returncode:
             self.fail(f"CLI failed: {p.stdout}\n{p.stderr}\nSSH: {(self.base / 'sshd.log').read_text()}")
@@ -241,7 +253,7 @@ class SSHIntegration(unittest.TestCase):
                 transport.copy(self.base / "forbidden-read", "empty/payload")
 
     def test_keys_deny_forwarding_and_directory_escape(self):
-        for name in ("read", "upload"):
+        for name in ("read", "upload", "cleanup"):
             ssh, host = ssh_args(self.endpoints[name])
             denied = subprocess.run(ssh + ["-W", f"127.0.0.1:{self.port}", host], capture_output=True, timeout=15)
             self.assertNotEqual(denied.returncode, 0)
@@ -252,6 +264,56 @@ class SSHIntegration(unittest.TestCase):
                                 capture_output=True, timeout=15)
         self.assertNotEqual(denied.returncode, 0)
         self.assertFalse(target.exists())
+
+    def test_managed_profile_infers_source_and_reclaims_payload(self):
+        config = read_json(self.config)
+        config.pop("sources")
+        config["ssh_config"] = str(self.ssh_config)
+        profile = config["profiles"]["default"]
+        profile["cleanup"] = self.endpoints["cleanup"]
+        profile["cleanup_after_receive"] = True
+        profile["remote_dir"] = str(self.tools)
+        alternate = self.base / "managed-config.json"
+        atomic_json(alternate, config)
+        source = self.base / "automatic-source.bin"
+        source.write_bytes(os.urandom(131072))
+        dest = self.base / "managed-out"
+        dest.mkdir()
+        result = self.cli("compute:" + str(source), str(dest) + "/", "--id", "managed", config=alternate)
+        self.assertIn('"relay_released": true', result.stdout)
+        self.assertEqual(digest(dest / source.name), digest(source))
+        self.assertFalse((self.relay / "compute/managed/payload").exists())
+        self.assertTrue((self.relay / "compute/managed/released.json").exists())
+        again = self.cli("compute:" + str(source), str(dest) + "/", "--id", "managed", config=alternate)
+        self.assertIn('"already_verified": true', again.stdout)
+        self.assertFalse((self.relay / "compute/managed/payload").exists())
+        other = self.base / "second-receiver"
+        other.mkdir()
+        failed = self.cli("receive", "relay://compute/managed", str(other) + "/", config=alternate, check=False)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("already released", failed.stdout)
+        ssh, host = ssh_args(self.endpoints["cleanup"])
+        denied = subprocess.run(ssh + [host, "rm -rf /"], capture_output=True, timeout=15)
+        self.assertNotEqual(denied.returncode, 0)
+
+    def test_maintenance_does_not_reuse_readonly_master(self):
+        socket_path = self.base / "shared-cm"
+        cfg = self.base / "shared-ssh-config"
+        cfg.write_text(f"Host sharedrelay\n HostName 127.0.0.1\n User {self.user}\n Port {self.port}\n"
+                       f" ControlMaster auto\n ControlPath {socket_path}\n")
+        read = {**self.endpoints["read"], "host": "sharedrelay", "config_file": str(cfg)}
+        ssh, host = ssh_args(read)
+        master = subprocess.Popen(ssh + ["-MN", host], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 5
+            while not socket_path.exists() and master.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.1)
+            self.assertTrue(socket_path.exists())
+            cleanup = {**self.endpoints["cleanup"], "host": "sharedrelay", "config_file": str(cfg)}
+            self.assertEqual(relay_action(cleanup, ["info"], self.base / "capability.log")["namespace"], "compute")
+        finally:
+            master.terminate()
+            master.communicate(timeout=5)
 
 
 if __name__ == "__main__":
