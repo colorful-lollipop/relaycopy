@@ -49,8 +49,8 @@ expires retained data. Retention is not a hard quota; use a separate filesystem
 or OS quota for storage limits. Never point this managed root at other users'
 data. Network controls are still needed to hide unrelated services on the host.
 
-For advanced existing deployments, `config.example.json` and
-`scripts/prepare_relay.py` support manually provisioned restricted rsync keys.
-Those legacy profiles do not receive automatic cleanup unless explicitly using
-the managed maintenance capability. Do not give a transfer agent the relay's
-administrator key as a substitute.
+For advanced existing deployments, `scripts/prepare_relay.py` prints options for
+manually provisioned restricted rsync keys. Legacy relays need explicit source
+configuration; `config.example.json` shows a managed profile. Legacy profiles do
+not receive automatic cleanup without the managed maintenance capability. Do
+not give a transfer agent the relay's administrator key as a substitute.

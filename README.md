@@ -29,6 +29,9 @@ python3 scripts/build.py
 ```
 
 Use `--sudo` when the administrator SSH account requires passwordless sudo.
+Alternatively, download the versioned `relaycp.pyz` and `SHA256SUMS` from
+[Releases](https://github.com/colorful-lollipop/relaycopy/releases), verify the
+checksum, and invoke it with `python3 relaycp.pyz`.
 Omit `--apply` to inspect a setup plan. Setup never changes global sshd settings,
 opens a new listener, or replaces another account's authorized_keys. It refuses
 an existing unmanaged account/directory. Distribution package installation

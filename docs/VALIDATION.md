@@ -32,8 +32,9 @@ credentials and never contact external infrastructure.
 
 ## Limits
 
-Python 3.10 compatibility is included in CI configuration but was not run locally.
-GitHub CI results are available in the repository's Actions tab after publishing.
+[GitHub CI](https://github.com/colorful-lollipop/relaycopy/actions/runs/42781300463)
+passed for code commit `efa4718`: Python 3.10 and 3.12 unit/maintenance tests,
+real SSH integration, and a scan of all Git history for secrets.
 Windows/macOS, very large files, storage exhaustion, network fairness, many
 simultaneous users, and long-running reliability have not been validated.
 
