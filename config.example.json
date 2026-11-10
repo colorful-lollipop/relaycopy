@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "profiles": {
+    "default": {
+      "relay": {"host": "relay-read"},
+      "download_root": "."
+    }
+  },
+  "sources": {
+    "compute": {
+      "host": "compute",
+      "namespace": "compute",
+      "remote_dir": "~/.cache/relaycopy",
+      "upload_key_file": "~/.config/relaycopy/compute-upload",
+      "upload_known_hosts_file": "~/.config/relaycopy/relay_known_hosts",
+      "upload": {
+        "host": "relayuser@relay.example.org",
+        "port": 2222,
+        "upload_root": "."
+      }
+    }
+  }
+}

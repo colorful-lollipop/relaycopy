@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "relaycopy"
+version = "0.1.0"
+description = "Resumable relay transfers with an scp-style interface"
+readme = "README.md"
+keywords = ["ssh", "rsync", "relay", "file-transfer", "agent-skills"]
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = []
+
+[project.scripts]
+relaycp = "relaycopy.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["relaycopy*"]
