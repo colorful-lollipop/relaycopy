@@ -19,7 +19,8 @@ def bundle():
         return executable.read_bytes()
     stream = io.BytesIO()
     with zipfile.ZipFile(stream, "w", zipfile.ZIP_DEFLATED) as z:
-        files = {"__main__.py": b"from relaycopy.cli import main\nraise SystemExit(main())\n"}
+        files = {"__main__.py": b"from relaycopy.cli import main\nraise SystemExit(main())\n",
+                 "LICENSE": Path(__file__).with_name("LICENSE").read_bytes()}
         files.update({"relaycopy/" + p.name: p.read_bytes() for p in Path(__file__).parent.glob("*.py")})
         for name, data in sorted(files.items()):
             info = zipfile.ZipInfo(name, date_time=(2026, 1, 1, 0, 0, 0))
